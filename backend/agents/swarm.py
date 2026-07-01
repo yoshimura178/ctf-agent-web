@@ -1,0 +1,309 @@
+"""ChallengeSwarm — Parallel solvers racing on one challenge."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from backend.agents.webchat_solver import WebChatSolver
+from backend.local_tasks import LocalTaskClient
+from backend.message_bus import ChallengeMessageBus
+from backend.models import DEFAULT_MODELS
+from backend.prompts import ChallengeMeta
+from backend.solver_base import (
+    CANCELLED,
+    ERROR,
+    FLAG_FOUND,
+    GAVE_UP,
+    SolverProtocol,
+    SolverResult,
+)
+
+if TYPE_CHECKING:
+    from backend.config import Settings
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ChallengeSwarm:
+    """Parallel solvers racing on one challenge."""
+
+    challenge_dir: str
+    meta: ChallengeMeta
+    task_client: LocalTaskClient
+    settings: Settings
+    model_specs: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
+    coordinator_inbox: asyncio.Queue | None = None
+    status_tracker: object | None = None
+
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    solvers: dict[str, SolverProtocol] = field(default_factory=dict)
+    findings: dict[str, str] = field(default_factory=dict)
+    winner: SolverResult | None = None
+    confirmed_flag: str | None = None
+    _flag_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _submit_count: dict[str, int] = field(default_factory=dict)  # per-model wrong submission count
+    _submitted_flags: set[str] = field(default_factory=set)  # dedup exact flags
+    _last_submit_time: dict[str, float] = field(default_factory=dict)  # per-model last submit timestamp
+    message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
+    last_results: dict[str, SolverResult] = field(default_factory=dict)
+
+    def _create_solver(self, model_spec: str):
+        """Create a webchat solver."""
+
+        def _submit_fn(flag, solve_context=None): return self.try_submit_flag(flag, model_spec, solve_context)
+        _notify = self._make_notify_fn(model_spec)
+
+        return WebChatSolver(
+            model_spec=model_spec,
+            challenge_dir=self.challenge_dir,
+            meta=self.meta,
+            task_client=self.task_client,
+            settings=self.settings,
+            cancel_event=self.cancel_event,
+            submit_fn=_submit_fn,
+            message_bus=self.message_bus,
+            notify_coordinator=_notify,
+            status_tracker=self.status_tracker,
+        )
+
+    def _make_notify_fn(self, model_spec: str):
+        """Create a callback that pushes solver messages to the coordinator inbox."""
+        async def _notify(message: str) -> None:
+            if self.coordinator_inbox:
+                self.coordinator_inbox.put_nowait(
+                    f"[{self.meta.name}/{model_spec}] {message}"
+                )
+        return _notify
+
+    def _gather_sibling_insights(self, exclude_model: str) -> str:
+        parts: list[str] = []
+        for model, finding in self.findings.items():
+            if model != exclude_model and finding:
+                parts.append(f"[{model}]: {finding}")
+        return "\n\n".join(parts) if parts else "No sibling insights available yet."
+
+    # Escalating cooldowns after incorrect submissions (per model)
+    SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]  # 0s, 30s, 2min, 5min, 10min
+
+    async def try_submit_flag(self, flag: str, model_spec: str, solve_context=None) -> tuple[str, bool]:
+        """Cooldown-gated, deduplicated flag submission. Returns (display, is_confirmed)."""
+        async with self._flag_lock:
+            if self.confirmed_flag:
+                return f"ALREADY SOLVED — flag already confirmed: {self.confirmed_flag}", True
+
+            normalized = flag.strip()
+
+            # Dedup exact flags across all models
+            if normalized in self._submitted_flags:
+                return "INCORRECT — already tried this exact flag.", False
+
+            # Escalating cooldown after incorrect submissions
+            wrong_count = self._submit_count.get(model_spec, 0)
+            cooldown_idx = min(wrong_count, len(self.SUBMISSION_COOLDOWNS) - 1)
+            cooldown = self.SUBMISSION_COOLDOWNS[cooldown_idx]
+            if cooldown > 0:
+                last_time = self._last_submit_time.get(model_spec, 0)
+                elapsed = time.monotonic() - last_time
+                if elapsed < cooldown:
+                    remaining = int(cooldown - elapsed)
+                    return (
+                        f"COOLDOWN — wait {remaining}s before submitting again. "
+                        f"You have {wrong_count} incorrect submissions. "
+                        "Use this time to do deeper analysis and verify your flag.",
+                        False,
+                    )
+
+            self._submitted_flags.add(normalized)
+
+            from backend.tools.core import do_submit_flag
+            display, is_confirmed = await do_submit_flag(
+                self.task_client,
+                self.meta.name,
+                flag,
+                model_spec=model_spec,
+                solve_context=solve_context,
+            )
+            if is_confirmed:
+                self.confirmed_flag = normalized
+            else:
+                self._submit_count[model_spec] = wrong_count + 1
+                self._last_submit_time[model_spec] = time.monotonic()
+            return display, is_confirmed
+
+    async def _run_solver(self, model_spec: str) -> SolverResult | None:
+        self._status(model_spec, state="starting", action="creating solver")
+        solver = self._create_solver(model_spec)
+        self.solvers[model_spec] = solver
+
+        try:
+            result, final_solver = await self._run_solver_loop(solver, model_spec)
+            solver = final_solver
+            self.last_results[model_spec] = result
+            self._status(
+                model_spec,
+                state=result.status,
+                action="finished",
+                detail=result.findings_summary or result.status,
+                steps=result.step_count,
+            )
+            return result
+        except Exception as e:
+            logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
+            result = SolverResult(
+                flag=None,
+                status=ERROR,
+                findings_summary=f"Fatal: {e}",
+                step_count=0,
+                log_path=getattr(getattr(solver, "tracer", None), "path", ""),
+            )
+            self.last_results[model_spec] = result
+            self._status(model_spec, state=ERROR, action="fatal error", detail=str(e), steps=0)
+            return result
+        finally:
+            await solver.stop()
+
+    async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
+        """Inner loop: start → run → bump → run → ..."""
+        bump_count = 0
+        consecutive_errors = 0
+        result = SolverResult(
+            flag=None, status=CANCELLED, findings_summary="",
+            step_count=0, log_path="",
+        )
+        self._status(model_spec, state="starting", action="starting solver")
+        await solver.start()
+
+        while not self.cancel_event.is_set():
+            self._status(model_spec, state="running", action="solver loop")
+            result = await solver.run_until_done_or_gave_up()
+
+            # Only broadcast useful findings — skip errors and broken solvers
+            if (result.status != ERROR
+                    and result.step_count > 0
+                    and result.findings_summary
+                    and not result.findings_summary.startswith(("Error:", "Turn failed:"))):
+                self.findings[model_spec] = result.findings_summary
+                await self.message_bus.post(model_spec, result.findings_summary[:500])
+
+            if result.status == FLAG_FOUND:
+                self.cancel_event.set()
+                self.winner = result
+                logger.info(
+                    f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}"
+                )
+                return result, solver
+
+            if result.status == CANCELLED:
+                break
+
+            if result.status in (GAVE_UP, ERROR):
+                if result.step_count == 0:
+                    logger.warning(
+                        f"[{self.meta.name}/{model_spec}] Broken (0 steps) — not bumping"
+                    )
+                    self._status(model_spec, state=result.status, action="broken", detail=result.findings_summary)
+                    break
+
+                # Track consecutive errors — stop after 3 in a row
+                if result.status == ERROR:
+                    consecutive_errors += 1
+                    if consecutive_errors >= 3:
+                        logger.warning(
+                            f"[{self.meta.name}/{model_spec}] {consecutive_errors} consecutive errors — giving up"
+                        )
+                        break
+                else:
+                    consecutive_errors = 0
+
+                bump_count += 1
+                # Cooldown between bumps — check cancellation during wait
+                try:
+                    self._status(
+                        model_spec,
+                        state="cooldown",
+                        action="cooldown before retry",
+                        detail=f"bump {bump_count}",
+                    )
+                    await asyncio.wait_for(
+                        self.cancel_event.wait(),
+                        timeout=min(bump_count * 30, 300),
+                    )
+                    break  # cancelled during cooldown
+                except TimeoutError:
+                    pass  # cooldown elapsed, proceed with bump
+                insights = self._gather_sibling_insights(model_spec)
+                self._status(model_spec, state="running", action="bumping solver", detail=insights[:300])
+                solver.bump(insights)
+                logger.info(
+                    f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
+                )
+                continue
+
+        return result, solver
+
+    async def run(self) -> SolverResult | None:
+        """Run all solvers in parallel. Returns the winner's result or None."""
+        tasks = [
+            asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
+            for spec in self.model_specs
+        ]
+
+        try:
+            while tasks:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                for task in done:
+                    try:
+                        result = task.result()
+                    except Exception:
+                        continue
+                    if result and result.status == FLAG_FOUND:
+                        self.cancel_event.set()
+                        for p in pending:
+                            p.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        return result
+
+                tasks = list(pending)
+
+            self.cancel_event.set()
+            return self.winner
+        except Exception as e:
+            logger.error(f"[{self.meta.name}] Swarm error: {e}", exc_info=True)
+            self.cancel_event.set()
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return None
+
+    def _status(self, model_spec: str, **kwargs) -> None:
+        if not self.status_tracker:
+            return
+        update = getattr(self.status_tracker, "update", None)
+        if update:
+            update(model_spec, **kwargs)
+
+    def kill(self) -> None:
+        """Cancel all agents for this challenge."""
+        self.cancel_event.set()
+
+    def get_status(self) -> dict:
+        """Get per-agent progress and findings."""
+        return {
+            "challenge": self.meta.name,
+            "cancelled": self.cancel_event.is_set(),
+            "winner": self.winner.flag if self.winner else None,
+            "agents": {
+                spec: {
+                    "findings": self.findings.get(spec, ""),
+                    "status": "running" if spec in self.solvers and not self.cancel_event.is_set()
+                             else ("won" if self.winner and self.winner.flag else "finished"),
+                }
+                for spec in self.model_specs
+            },
+        }

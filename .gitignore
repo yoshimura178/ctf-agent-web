@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Google profile
+.chrome-profile
+
+# Task
+task
+challenges-local
+logs
